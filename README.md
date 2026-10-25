@@ -83,4 +83,4 @@ python -m pytest --cov=app --cov-report=term-missing --cov-report=html
 
 ## Pull request test agent
 
-The single-agent Copilot workflow, isolated test jobs, reusable skills, security boundaries, and setup prerequisites are documented in [SOLUTION.md](SOLUTION.md). It runs for same-repository pull requests and commits verified generated tests to the PR branch.
+The single-agent Copilot workflow, isolated test jobs, reusable skills, security boundaries, and setup prerequisites are documented in [SOLUTION.md](SOLUTION.md). It runs for same-repository pull requests and commits verified generated tests to the PR branch. A manual `Bulk test agent` workflow can also raise coverage for the whole application and open a pull request with the result.

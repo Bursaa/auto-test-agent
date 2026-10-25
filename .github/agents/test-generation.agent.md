@@ -1,6 +1,6 @@
 ---
 name: test-generation
-description: "Generate or update focused unit tests for changed frontend and backend application code in a pull request. Use when a PR changes application behavior and needs test coverage."
+description: "Generate or update focused unit tests for changed frontend and backend application code in a pull request, or for a listed scope in a manual coverage run. Use when application behavior needs test coverage."
 tools: [read, search, edit]
 user-invocable: true
 ---
