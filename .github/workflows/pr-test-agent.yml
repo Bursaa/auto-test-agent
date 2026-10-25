@@ -613,7 +613,7 @@ jobs:
     permissions:
       contents: write
       issues: write
-      pull-requests: read
+      pull-requests: write
     steps:
       - name: Check out trusted publication tools
         uses: actions/checkout@v4
@@ -773,9 +773,10 @@ jobs:
               ['backend', process.env.BASELINE_BACKEND_COVERAGE, finalBackendCoverage],
               ['frontend', process.env.BASELINE_FRONTEND_COVERAGE, finalFrontendCoverage]
             ].map(([area, base, pr]) => {
+              const present = value => value !== undefined && value !== null && String(value).trim() !== '';
               const baseNumber = Number(base);
               const prNumber = Number(pr);
-              const valid = Number.isFinite(baseNumber) && Number.isFinite(prNumber);
+              const valid = present(base) && present(pr) && Number.isFinite(baseNumber) && Number.isFinite(prNumber);
               const delta = valid ? prNumber - baseNumber : null;
               const deltaText = delta === null ? 'unavailable' : `${delta > 0 ? '+' : ''}${delta.toFixed(2)} pp`;
               return `| ${area} | ${valid ? `${baseNumber}%` : 'unavailable'} | ${valid ? `${prNumber}%` : 'unavailable'} | ${deltaText} |`;

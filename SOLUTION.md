@@ -82,6 +82,10 @@ The generated artifact contains only allowlisted test file contents, checksums, 
 
 The workflow runs on PR open/reopen, synchronization, and ready-for-review. It uses the built-in `GITHUB_TOKEN`; no PAT is required. The Copilot CLI is installed in the agent jobs.
 
+### Bulk coverage run (manual)
+
+`.github/workflows/bulk-test-agent.yml` is a `workflow_dispatch` workflow that treats every application file in the selected scope (`all`, `backend`, or `frontend`) as changed. It uses the same agent, skills, and orchestrator (`prepare --all-files`, `prompt --bulk`), so the agent adds or updates tests where coverage is weak and skips files that are already covered. Test execution stays in token-free jobs; the publisher commits the verified tests to a new `agent/coverage-<run>` branch and opens a pull request with the per-file decisions and the before/after coverage. Run it from **Actions → Bulk test agent → Run workflow** (the file must exist on the default branch for the button to appear). The repository setting **Settings → Actions → General → Allow GitHub Actions to create and approve pull requests** must be enabled. Pull requests created with `GITHUB_TOKEN` do not trigger other workflows, so close and reopen the PR (or push to it) to start `ci.yml`. Bulk mode has no repair turn: if the generated tests fail, nothing is published and the verification logs explain why.
+
 ## Local validation and observed baseline
 
 The base application currently has 21 backend tests and 18 frontend tests. This change adds unit tests only for the new agent orchestrator; it does not add tests for unrelated application features. The agent's PR workflow reports the base and PR coverage values and their difference when it runs. Coverage is diagnostic, not a gate.
@@ -100,6 +104,7 @@ For a PR that changes `backend/app/features/todos/validators.py` with a new titl
 
 ## Limitations and production follow-ups
 
+- Bulk mode is capped at 200 application files and a 50-file test bundle per run; use the `scope` input to split larger runs. It does not run a repair turn.
 - Only same-repository PRs receive agent generation and the test commit. Fork PRs are intentionally skipped.
 - The repair budget is one turn. A failing repair is reported but never committed.
 - The model may still generate incorrect tests; passing tests and coverage are not proof of test quality. Human review is required.

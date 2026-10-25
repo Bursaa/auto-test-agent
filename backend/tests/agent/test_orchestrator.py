@@ -9,8 +9,11 @@ import pytest
 from scripts.agent.orchestrator import (
     OrchestrationError,
     RunState,
+    all_application_files,
     apply_bundle,
     command_accept_plan,
+    command_prepare,
+    command_prompt,
     command_record_repair,
     command_record_verification,
     coverage_value,
@@ -378,6 +381,102 @@ def test_stage_bundle_stages_only_verified_artifact_files(tmp_path):
     generated.write_text("modified after verification\n", encoding="utf-8")
     with pytest.raises(OrchestrationError, match="changed before staging"):
         stage_bundle(tmp_path, bundle, "abc123")
+
+
+def init_repo_with_files(tmp_path, paths):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    for path in paths:
+        file = tmp_path / path
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+
+
+REPO_FILES = [
+    "backend/app/factory.py",
+    "backend/app/__init__.py",
+    "backend/tests/test_x.py",
+    "frontend/src/lib/http.ts",
+    "frontend/src/lib/http.test.ts",
+    "frontend/src/design-system/Button.stories.tsx",
+    "README.md",
+]
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [
+        ("all", ["backend/app/factory.py", "frontend/src/lib/http.ts"]),
+        ("backend", ["backend/app/factory.py"]),
+        ("frontend", ["frontend/src/lib/http.ts"]),
+    ],
+)
+def test_all_application_files_lists_only_tracked_application_code(tmp_path, scope, expected):
+    init_repo_with_files(tmp_path, REPO_FILES)
+
+    assert all_application_files(tmp_path, scope) == expected
+
+
+def test_all_application_files_rejects_unknown_scope(tmp_path):
+    init_repo_with_files(tmp_path, REPO_FILES)
+
+    with pytest.raises(OrchestrationError):
+        all_application_files(tmp_path, "docs")
+
+
+def prepare_args(tmp_path, **overrides):
+    values = {
+        "repo_dir": str(tmp_path),
+        "base_sha": None,
+        "head_sha": "abc123",
+        "all_files": True,
+        "scope": "all",
+        "state_file": str(tmp_path / "state.json"),
+        "changed_files_file": str(tmp_path / "changed.json"),
+        "github_output": str(tmp_path / "out.txt"),
+    }
+    values.update(overrides)
+    return Namespace(**values)
+
+
+def test_prepare_all_files_treats_the_whole_application_as_changed(tmp_path):
+    init_repo_with_files(tmp_path, REPO_FILES)
+
+    command_prepare(prepare_args(tmp_path))
+
+    state = read_state(tmp_path / "state.json")
+    assert state.current == "DECIDE"
+    assert state.changed_files == ["backend/app/factory.py", "frontend/src/lib/http.ts"]
+    assert "has_code=true" in (tmp_path / "out.txt").read_text(encoding="utf-8")
+
+
+def test_prepare_requires_a_base_sha_outside_all_files_mode(tmp_path):
+    init_repo_with_files(tmp_path, REPO_FILES)
+
+    with pytest.raises(OrchestrationError):
+        command_prepare(prepare_args(tmp_path, all_files=False))
+
+
+def test_bulk_prompt_explains_the_coverage_run(tmp_path):
+    init_repo_with_files(tmp_path, REPO_FILES)
+    command_prepare(prepare_args(tmp_path))
+
+    def render(bulk):
+        output = tmp_path / f"prompt-{bulk}.md"
+        command_prompt(
+            Namespace(
+                mode="generate",
+                state_file=str(tmp_path / "state.json"),
+                repo_dir=str(tmp_path),
+                output=str(output),
+                failure_log=None,
+                bulk=bulk,
+            )
+        )
+        return output.read_text(encoding="utf-8")
+
+    assert "manual coverage-improvement run" in render(True)
+    assert "manual coverage-improvement run" not in render(False)
 
 
 def test_make_bundle_collects_only_test_changes(tmp_path):
