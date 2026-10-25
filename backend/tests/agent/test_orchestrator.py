@@ -588,3 +588,17 @@ def test_backend_coverage_report_returns_statement_percentage(tmp_path):
 def test_classifies_application_and_test_paths(path, application, test):
     assert is_application_file(path) is application
     assert is_allowed_test(path) is test
+
+
+def test_extract_agent_plan_finds_json_surrounded_by_prose():
+    plan = '{"decision":"skip","summary":"s","file_decisions":[],"targets":[],"skills_used":[],"uncertainties":[]}'
+    output = json.dumps({"type": "assistant.message", "content": f"Here is the plan:\n{plan}\nDone."})
+
+    assert extract_agent_plan(output)["decision"] == "skip"
+
+
+def test_extract_agent_plan_rejects_non_json_response():
+    output = json.dumps({"type": "assistant.message", "content": "no json here"})
+
+    with pytest.raises(OrchestrationError, match="not valid plan JSON"):
+        extract_agent_plan(output)

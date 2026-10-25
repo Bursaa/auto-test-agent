@@ -317,6 +317,26 @@ def validate_plan(value: Any, changed_files: list[str]) -> dict[str, Any]:
     }
 
 
+def _parse_plan_json(text: str) -> Any:
+    response = text.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", response, flags=re.DOTALL)
+    if fenced:
+        response = fenced.group(1)
+    try:
+        return json.loads(response)
+    except json.JSONDecodeError:
+        pass
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", response):
+        try:
+            value, _ = decoder.raw_decode(response[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and "decision" in value:
+            return value
+    return None
+
+
 def extract_agent_plan(jsonl_text: str) -> dict[str, Any]:
     messages: list[str] = []
     seen_types: dict[str, int] = {}
@@ -342,14 +362,13 @@ def extract_agent_plan(jsonl_text: str) -> dict[str, Any]:
             "Copilot output did not contain an assistant message. "
             f"Observed event types: {json.dumps(seen_types, sort_keys=True)[:500]}"
         )
-    response = messages[-1].strip()
-    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", response, flags=re.DOTALL)
-    if fenced:
-        response = fenced.group(1)
-    try:
-        plan = json.loads(response)
-    except json.JSONDecodeError as error:
-        raise OrchestrationError("The agent response is not valid plan JSON.") from error
+    plan = None
+    for message in reversed(messages):
+        plan = _parse_plan_json(message)
+        if plan is not None:
+            break
+    if plan is None:
+        raise OrchestrationError("The agent response is not valid plan JSON.")
     if not isinstance(plan, dict):
         raise OrchestrationError("The agent response must be a JSON object.")
     return plan
