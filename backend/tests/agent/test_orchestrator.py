@@ -12,6 +12,7 @@ from scripts.agent.orchestrator import (
     all_application_files,
     apply_bundle,
     command_accept_plan,
+    command_parse_plan,
     command_prepare,
     command_prompt,
     command_record_repair,
@@ -216,6 +217,51 @@ def test_extract_agent_plan_reads_content_nested_in_data_and_ignores_empty_tool_
     )
 
     assert extract_agent_plan(output)["decision"] == "skip"
+
+
+def test_validate_plan_error_lists_the_files_missing_from_file_decisions():
+    plan = make_plan()
+    changed = ["backend/app/features/todos/validators.py", "backend/app/factory.py"]
+
+    with pytest.raises(OrchestrationError, match="expected 2.*got 1.*backend/app/factory.py"):
+        validate_plan(plan, changed)
+
+
+def test_parse_plan_validates_against_state_and_retry_prompt_includes_feedback(tmp_path):
+    state = RunState("abc123", ["backend/app/features/todos/validators.py", "backend/app/factory.py"])
+    state.advance("ANALYZE")
+    state.advance("DECIDE")
+    write_state(tmp_path / "state.json", state)
+    (tmp_path / "out.jsonl").write_text(
+        json.dumps({"type": "assistant.message", "data": {"content": json.dumps(make_plan())}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OrchestrationError, match="factory.py"):
+        command_parse_plan(
+            Namespace(
+                jsonl_file=str(tmp_path / "out.jsonl"),
+                plan_file=str(tmp_path / "plan.json"),
+                state_file=str(tmp_path / "state.json"),
+            )
+        )
+    assert not (tmp_path / "plan.json").exists()
+
+    (tmp_path / "error.txt").write_text("Missing: backend/app/factory.py", encoding="utf-8")
+    command_prompt(
+        Namespace(
+            mode="generate",
+            state_file=str(tmp_path / "state.json"),
+            repo_dir=str(tmp_path),
+            output=str(tmp_path / "prompt.md"),
+            failure_log=None,
+            bulk=False,
+            retry_feedback=str(tmp_path / "error.txt"),
+        )
+    )
+    prompt = (tmp_path / "prompt.md").read_text(encoding="utf-8")
+    assert "exactly 2 entries" in prompt
+    assert "Missing: backend/app/factory.py" in prompt
 
 
 def test_extract_agent_plan_rejects_missing_assistant_response():

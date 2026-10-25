@@ -148,28 +148,40 @@ jobs:
             --repo-dir "$GITHUB_WORKSPACE/src" \
             --output "$RUNNER_TEMP/prompt.md"
 
-      - name: Invoke the single test-generation agent
+      - name: Invoke the single test-generation agent (one format retry)
         if: steps.prepare.outputs.has_code == 'true'
         working-directory: ${{ runner.temp }}/copilot-workspace
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          ORCHESTRATOR: ${{ github.workspace }}/trusted/scripts/agent/orchestrator.py
         run: |
-          copilot \
-            --agent=test-generation \
-            --add-dir="$GITHUB_WORKSPACE/src" \
-            --available-tools='view,glob,grep,create,edit' \
-            --allow-tool='write' \
-            --output-format=json \
-            -p "$(cat "$RUNNER_TEMP/prompt.md")" \
-            > "$RUNNER_TEMP/copilot-output.jsonl"
-
-      - name: Parse and validate the structured agent plan
-        if: steps.prepare.outputs.has_code == 'true'
-        working-directory: trusted
-        run: |
-          python scripts/agent/orchestrator.py parse-plan \
-            --jsonl-file "$RUNNER_TEMP/copilot-output.jsonl" \
-            --plan-file "$RUNNER_TEMP/plan.json"
+          for attempt in 1 2; do
+            copilot \
+              --agent=test-generation \
+              --add-dir="$GITHUB_WORKSPACE/src" \
+              --available-tools='view,glob,grep,create,edit' \
+              --allow-tool='write' \
+              --output-format=json \
+              -p "$(cat "$RUNNER_TEMP/prompt.md")" \
+              > "$RUNNER_TEMP/copilot-output.jsonl"
+            if python "$ORCHESTRATOR" parse-plan \
+              --jsonl-file "$RUNNER_TEMP/copilot-output.jsonl" \
+              --plan-file "$RUNNER_TEMP/plan.json" \
+              --state-file "$RUNNER_TEMP/state.json" 2> "$RUNNER_TEMP/plan-error.txt"; then
+              exit 0
+            fi
+            cat "$RUNNER_TEMP/plan-error.txt"
+            if [ "$attempt" = "2" ]; then
+              exit 1
+            fi
+            python "$ORCHESTRATOR" prompt \
+              --mode generate \
+              --bulk \
+              --state-file "$RUNNER_TEMP/state.json" \
+              --repo-dir "$GITHUB_WORKSPACE/src" \
+              --retry-feedback "$RUNNER_TEMP/plan-error.txt" \
+              --output "$RUNNER_TEMP/prompt.md"
+          done
 
       - name: Accept plan and advance the state machine
         id: accept-plan

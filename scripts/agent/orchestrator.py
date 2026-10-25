@@ -176,8 +176,17 @@ def validate_plan(value: Any, changed_files: list[str]) -> dict[str, Any]:
     normalized_changed_files = set(changed_files)
     file_decisions = value["file_decisions"]
     if not isinstance(file_decisions, list) or len(file_decisions) != len(changed_files):
+        listed = {
+            item.get("implementation_file")
+            for item in file_decisions
+            if isinstance(item, dict)
+        } if isinstance(file_decisions, list) else set()
+        missing = sorted(normalized_changed_files - listed)
         raise OrchestrationError(
-            "Plan must include one decision for every changed implementation file."
+            "Plan must include one decision for every changed implementation file: "
+            f"expected {len(changed_files)} file_decisions entries, got "
+            f"{len(file_decisions) if isinstance(file_decisions, list) else 'none'}. "
+            f"Missing: {', '.join(missing[:30]) or 'none (duplicates or extra entries)'}"
         )
     normalized_decisions: dict[str, str] = {}
     normalized_file_decisions = []
@@ -797,7 +806,16 @@ def command_prompt(args: argparse.Namespace) -> None:
             indent=2,
         ),
         "Provide exactly one file_decisions entry for every changed implementation file. For skip or report_uncertainty, use an empty targets array. For add_tests or update_tests, provide at least one target matching an actionable file decision. Every target must refer to a changed implementation file, an allowed test path, and meaningful scenarios. Do not claim test results; verification happens in another isolated job.",
+        f"HARD REQUIREMENT: file_decisions must contain exactly {len(state.changed_files)} entries, one per path in the list above, each path exactly once, with no grouping, wildcards, or extra paths. Decide for every file even when most are skipped; use skip with a short reason for files that need no tests. Before answering, count your file_decisions entries and compare them with the list.",
     ]
+    retry_feedback = getattr(args, "retry_feedback", None)
+    if retry_feedback:
+        prompt.extend(
+            [
+                "Your previous answer was rejected by the deterministic validator. Fix exactly this problem and return the full corrected JSON object. Validator message (diagnostic only):",
+                Path(retry_feedback).read_text(encoding="utf-8", errors="replace")[:4000],
+            ]
+        )
     if args.mode == "repair":
         if state.current != "REPAIR" or state.plan is None:
             raise OrchestrationError("Repair prompt requires a plan in REPAIR state.")
@@ -819,6 +837,9 @@ def command_prompt(args: argparse.Namespace) -> None:
 def command_parse_plan(args: argparse.Namespace) -> None:
     raw_output = Path(args.jsonl_file).read_text(encoding="utf-8", errors="replace")
     plan = extract_agent_plan(raw_output)
+    if args.state_file:
+        state = read_state(Path(args.state_file))
+        plan = validate_plan(plan, state.changed_files)
     Path(args.plan_file).write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
 
 
@@ -894,11 +915,13 @@ def build_parser() -> argparse.ArgumentParser:
     prompt.add_argument("--output", required=True)
     prompt.add_argument("--failure-log")
     prompt.add_argument("--bulk", action="store_true")
+    prompt.add_argument("--retry-feedback")
     prompt.set_defaults(handler=command_prompt)
 
     parse_plan = commands.add_parser("parse-plan")
     parse_plan.add_argument("--jsonl-file", required=True)
     parse_plan.add_argument("--plan-file", required=True)
+    parse_plan.add_argument("--state-file")
     parse_plan.set_defaults(handler=command_parse_plan)
 
     package = commands.add_parser("package")
