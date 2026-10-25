@@ -1,0 +1,826 @@
+name: PR test agent
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: pr-test-agent-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  baseline:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      backend: ${{ steps.backend-tests.outcome }}
+      frontend: ${{ steps.frontend-tests.outcome }}
+      backend_coverage: ${{ steps.backend-tests.outputs.coverage }}
+      frontend_coverage: ${{ steps.frontend-tests.outputs.coverage }}
+      passed: ${{ steps.backend-tests.outcome == 'success' && steps.frontend-tests.outcome == 'success' }}
+    steps:
+      - name: Check out trusted base revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install base test dependencies
+        working-directory: trusted
+        run: |
+          python -m pip install -r backend/requirements.txt
+          npm ci --prefix frontend
+
+      - name: Run backend base tests
+        id: backend-tests
+        continue-on-error: true
+        working-directory: trusted/backend
+        run: |
+          set +e
+          python -m pytest --cov=app --cov-report=json:"$RUNNER_TEMP/backend-base-coverage.json" --cov-report=term-missing
+          result=$?
+          coverage=$(jq -r '.totals.percent_covered // empty' "$RUNNER_TEMP/backend-base-coverage.json" 2>/dev/null || true)
+          echo "coverage=$coverage" >> "$GITHUB_OUTPUT"
+          exit "$result"
+
+      - name: Run frontend base tests
+        id: frontend-tests
+        continue-on-error: true
+        working-directory: trusted/frontend
+        run: |
+          set +e
+          npm run test:coverage
+          result=$?
+          coverage=$(jq -r '.total.statements.pct // empty' coverage/coverage-summary.json 2>/dev/null || true)
+          echo "coverage=$coverage" >> "$GITHUB_OUTPUT"
+          exit "$result"
+
+  generate:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      copilot-requests: write
+    outputs:
+      has_code: ${{ steps.prepare.outputs.has_code }}
+      has_tests: ${{ steps.accept-plan.outputs.has_tests || 'false' }}
+      decision: ${{ steps.accept-plan.outputs.decision || 'skip' }}
+    steps:
+      - name: Check out trusted workflow tools and customizations
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Check out PR source for read/edit only
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js for Copilot CLI
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Initialize workflow state and classify the PR diff
+        id: prepare
+        working-directory: trusted
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python scripts/agent/orchestrator.py prepare \
+            --repo-dir "$GITHUB_WORKSPACE/pr" \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --state-file "$RUNNER_TEMP/state.json" \
+            --changed-files-file "$RUNNER_TEMP/changed-files.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Prepare isolated trusted agent workspace
+        if: steps.prepare.outputs.has_code == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/copilot-workspace/.github"
+          cp -R trusted/.github/agents trusted/.github/skills "$RUNNER_TEMP/copilot-workspace/.github/"
+
+      - name: Install GitHub Copilot CLI
+        if: steps.prepare.outputs.has_code == 'true'
+        run: npm install --global @github/copilot
+
+      - name: Create the generation prompt
+        if: steps.prepare.outputs.has_code == 'true'
+        working-directory: trusted
+        run: |
+          python scripts/agent/orchestrator.py prompt \
+            --mode generate \
+            --state-file "$RUNNER_TEMP/state.json" \
+            --repo-dir "$GITHUB_WORKSPACE/pr" \
+            --output "$RUNNER_TEMP/prompt.md"
+
+      - name: Invoke the single test-generation agent
+        id: agent
+        if: steps.prepare.outputs.has_code == 'true'
+        working-directory: ${{ runner.temp }}/copilot-workspace
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          copilot \
+            --agent=test-generation \
+            --add-dir="$GITHUB_WORKSPACE/pr" \
+            --available-tools='read,search,edit' \
+            --output-format=json \
+            -p "$(cat "$RUNNER_TEMP/prompt.md")" \
+            > "$RUNNER_TEMP/copilot-output.jsonl"
+
+      - name: Parse and validate the structured agent plan
+        if: steps.prepare.outputs.has_code == 'true'
+        working-directory: trusted
+        run: |
+          python scripts/agent/orchestrator.py parse-plan \
+            --jsonl-file "$RUNNER_TEMP/copilot-output.jsonl" \
+            --plan-file "$RUNNER_TEMP/plan.json"
+
+      - name: Accept plan and advance the state machine
+        id: accept-plan
+        if: steps.prepare.outputs.has_code == 'true'
+        working-directory: trusted
+        run: |
+          python scripts/agent/orchestrator.py accept-plan \
+            --state-file "$RUNNER_TEMP/state.json" \
+            --plan-file "$RUNNER_TEMP/plan.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Package only allowlisted test files
+        id: package
+        if: always() && steps.prepare.outcome == 'success' && (steps.accept-plan.outcome == 'success' || steps.prepare.outputs.has_code == 'false')
+        working-directory: trusted
+        run: |
+          python scripts/agent/orchestrator.py package \
+            --state-file "$RUNNER_TEMP/state.json" \
+            --repo-dir "$GITHUB_WORKSPACE/pr" \
+            --bundle-file "$RUNNER_TEMP/bundle.json"
+
+      - name: Upload validated generation artifact
+        if: always() && steps.package.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-tests
+          path: |
+            ${{ runner.temp }}/bundle.json
+            ${{ runner.temp }}/state.json
+          if-no-files-found: error
+          retention-days: 3
+
+  verify-backend:
+    needs: generate
+    if: needs.generate.result == 'success' && needs.generate.outputs.has_tests == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      passed: ${{ steps.backend-tests.outcome == 'success' }}
+      coverage: ${{ steps.backend-tests.outputs.coverage }}
+    steps:
+      - name: Check out trusted orchestration tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Check out PR source for unprivileged test execution
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download generated tests
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-tests
+          path: ${{ runner.temp }}/generated
+
+      - name: Apply validated test bundle
+        working-directory: trusted
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python scripts/agent/orchestrator.py apply \
+            --bundle-file "$RUNNER_TEMP/generated/bundle.json" \
+            --repo-dir "$GITHUB_WORKSPACE/pr" \
+            --head-sha "$HEAD_SHA" \
+            --base-sha "$BASE_SHA"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PR backend test dependencies
+        working-directory: pr
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Run PR backend tests
+        id: backend-tests
+        continue-on-error: true
+        working-directory: pr/backend
+        run: |
+          set +e
+          python -m pytest --cov=app --cov-report=json:"$RUNNER_TEMP/backend-pr-coverage.json" --cov-report=term-missing
+          result=$?
+          coverage=$(jq -r '.totals.percent_covered // empty' "$RUNNER_TEMP/backend-pr-coverage.json" 2>/dev/null || true)
+          echo "coverage=$coverage" >> "$GITHUB_OUTPUT"
+          exit "$result"
+
+  verify-frontend:
+    needs: generate
+    if: needs.generate.result == 'success' && needs.generate.outputs.has_tests == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      passed: ${{ steps.frontend-tests.outcome == 'success' }}
+      coverage: ${{ steps.frontend-tests.outputs.coverage }}
+    steps:
+      - name: Check out trusted orchestration tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Check out PR source for unprivileged test execution
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download generated tests
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-tests
+          path: ${{ runner.temp }}/generated
+
+      - name: Apply validated test bundle
+        working-directory: trusted
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python scripts/agent/orchestrator.py apply \
+            --bundle-file "$RUNNER_TEMP/generated/bundle.json" \
+            --repo-dir "$GITHUB_WORKSPACE/pr" \
+            --head-sha "$HEAD_SHA" \
+            --base-sha "$BASE_SHA"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install PR frontend test dependencies
+        working-directory: pr/frontend
+        run: npm ci
+
+      - name: Run PR frontend tests
+        id: frontend-tests
+        continue-on-error: true
+        working-directory: pr/frontend
+        run: |
+          set +e
+          npm run test:coverage
+          result=$?
+          coverage=$(jq -r '.total.statements.pct // empty' coverage/coverage-summary.json 2>/dev/null || true)
+          echo "coverage=$coverage" >> "$GITHUB_OUTPUT"
+          exit "$result"
+
+  failure-logs:
+    needs: [baseline, verify-backend, verify-frontend]
+    if: always() && needs.baseline.result == 'success' && needs.baseline.outputs.passed == 'true' && needs.verify-backend.result == 'success' && needs.verify-frontend.result == 'success' && (needs.verify-backend.outputs.passed != 'true' || needs.verify-frontend.outputs.passed != 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Retrieve failed test logs from this workflow run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          : > "$RUNNER_TEMP/failure.log"
+          job_ids=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" \
+            --jq '.jobs[] | select((.name | endswith("verify-backend")) or (.name | endswith("verify-frontend"))) | .id')
+          if [ -z "$job_ids" ]; then
+            echo "Could not locate verification jobs for this workflow run." >&2
+            exit 1
+          fi
+          while IFS= read -r job_id; do
+            gh run view "$GITHUB_RUN_ID" --job "$job_id" --log >> "$RUNNER_TEMP/failure.log"
+          done <<< "$job_ids"
+          head -c 50000 "$RUNNER_TEMP/failure.log" > "$RUNNER_TEMP/failure-bounded.log"
+          mv "$RUNNER_TEMP/failure-bounded.log" "$RUNNER_TEMP/failure.log"
+
+      - name: Upload verification logs for the repair agent
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-failure-logs
+          path: ${{ runner.temp }}/failure.log
+          if-no-files-found: error
+          retention-days: 3
+
+  repair:
+    needs: [baseline, generate, verify-backend, verify-frontend, failure-logs]
+    if: always() && needs.baseline.result == 'success' && needs.baseline.outputs.passed == 'true' && needs.generate.result == 'success' && needs.generate.outputs.has_tests == 'true' && needs.verify-backend.result == 'success' && needs.verify-frontend.result == 'success' && needs.failure-logs.result == 'success' && (needs.verify-backend.outputs.passed != 'true' || needs.verify-frontend.outputs.passed != 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      copilot-requests: write
+    steps:
+      - name: Check out trusted workflow tools and customizations
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Check out PR source for read/edit only
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download original generated tests
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-tests
+          path: ${{ runner.temp }}/generated
+
+      - name: Apply original tests and advance to the repair state
+        working-directory: trusted
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python scripts/agent/orchestrator.py apply \
+            --bundle-file "$RUNNER_TEMP/generated/bundle.json" \
+            --repo-dir "$GITHUB_WORKSPACE/pr" \
+            --head-sha "$HEAD_SHA" \
+            --base-sha "$BASE_SHA"
+          python scripts/agent/orchestrator.py record-verification \
+            --state-file "$RUNNER_TEMP/generated/state.json" \
+            --result failed
+
+      - name: Download test failure diagnostics
+        uses: actions/download-artifact@v4
+        with:
+          name: verification-failure-logs
+          path: ${{ runner.temp }}/verification-logs
+
+      - name: Set up Node.js for Copilot CLI
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install GitHub Copilot CLI
+        run: npm install --global @github/copilot
+
+      - name: Prepare isolated trusted agent workspace
+        run: |
+          mkdir -p "$RUNNER_TEMP/copilot-workspace/.github"
+          cp -R trusted/.github/agents trusted/.github/skills "$RUNNER_TEMP/copilot-workspace/.github/"
+
+      - name: Create the bounded repair prompt
+        working-directory: trusted
+        run: |
+          python scripts/agent/orchestrator.py prompt \
+            --mode repair \
+            --state-file "$RUNNER_TEMP/generated/state.json" \
+            --repo-dir "$GITHUB_WORKSPACE/pr" \
+            --failure-log "$RUNNER_TEMP/verification-logs/failure.log" \
+            --output "$RUNNER_TEMP/prompt.md"
+
+      - name: Invoke the same test-generation agent for its single repair turn
+        working-directory: ${{ runner.temp }}/copilot-workspace
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          copilot \
+            --agent=test-generation \
+            --add-dir="$GITHUB_WORKSPACE/pr" \
+            --available-tools='read,search,edit' \
+            --output-format=json \
+            -p "$(cat "$RUNNER_TEMP/prompt.md")" \
+            > "$RUNNER_TEMP/copilot-output.jsonl"
+
+      - name: Validate and package repaired tests
+        working-directory: trusted
+        run: |
+          python scripts/agent/orchestrator.py parse-plan \
+            --jsonl-file "$RUNNER_TEMP/copilot-output.jsonl" \
+            --plan-file "$RUNNER_TEMP/plan.json"
+          python scripts/agent/orchestrator.py record-repair \
+            --state-file "$RUNNER_TEMP/generated/state.json" \
+            --plan-file "$RUNNER_TEMP/plan.json"
+          python scripts/agent/orchestrator.py package \
+            --state-file "$RUNNER_TEMP/generated/state.json" \
+            --repo-dir "$GITHUB_WORKSPACE/pr" \
+            --bundle-file "$RUNNER_TEMP/bundle.json"
+
+      - name: Upload repaired tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: repaired-tests
+          path: |
+            ${{ runner.temp }}/bundle.json
+            ${{ runner.temp }}/generated/state.json
+          if-no-files-found: error
+          retention-days: 3
+
+  verify-repair-backend:
+    needs: [baseline, repair]
+    if: always() && needs.baseline.result == 'success' && needs.baseline.outputs.passed == 'true' && needs.repair.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      passed: ${{ steps.backend-tests.outcome == 'success' }}
+      coverage: ${{ steps.backend-tests.outputs.coverage }}
+    steps:
+      - name: Check out trusted orchestration tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Check out PR source for unprivileged test execution
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download repaired tests
+        uses: actions/download-artifact@v4
+        with:
+          name: repaired-tests
+          path: ${{ runner.temp }}/repaired
+
+      - name: Apply repaired test bundle
+        working-directory: trusted
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python scripts/agent/orchestrator.py apply \
+            --bundle-file "$RUNNER_TEMP/repaired/bundle.json" \
+            --repo-dir "$GITHUB_WORKSPACE/pr" \
+            --head-sha "$HEAD_SHA" \
+            --base-sha "$BASE_SHA"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PR backend test dependencies
+        working-directory: pr
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Run repaired PR backend tests
+        id: backend-tests
+        continue-on-error: true
+        working-directory: pr/backend
+        run: |
+          set +e
+          python -m pytest --cov=app --cov-report=json:"$RUNNER_TEMP/backend-repair-coverage.json" --cov-report=term-missing
+          result=$?
+          coverage=$(jq -r '.totals.percent_covered // empty' "$RUNNER_TEMP/backend-repair-coverage.json" 2>/dev/null || true)
+          echo "coverage=$coverage" >> "$GITHUB_OUTPUT"
+          exit "$result"
+
+  verify-repair-frontend:
+    needs: [baseline, repair]
+    if: always() && needs.baseline.result == 'success' && needs.baseline.outputs.passed == 'true' && needs.repair.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      passed: ${{ steps.frontend-tests.outcome == 'success' }}
+      coverage: ${{ steps.frontend-tests.outputs.coverage }}
+    steps:
+      - name: Check out trusted orchestration tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Check out PR source for unprivileged test execution
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download repaired tests
+        uses: actions/download-artifact@v4
+        with:
+          name: repaired-tests
+          path: ${{ runner.temp }}/repaired
+
+      - name: Apply repaired test bundle
+        working-directory: trusted
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python scripts/agent/orchestrator.py apply \
+            --bundle-file "$RUNNER_TEMP/repaired/bundle.json" \
+            --repo-dir "$GITHUB_WORKSPACE/pr" \
+            --head-sha "$HEAD_SHA" \
+            --base-sha "$BASE_SHA"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install PR frontend test dependencies
+        working-directory: pr/frontend
+        run: npm ci
+
+      - name: Run repaired PR frontend tests
+        id: frontend-tests
+        continue-on-error: true
+        working-directory: pr/frontend
+        run: |
+          set +e
+          npm run test:coverage
+          result=$?
+          coverage=$(jq -r '.total.statements.pct // empty' coverage/coverage-summary.json 2>/dev/null || true)
+          echo "coverage=$coverage" >> "$GITHUB_OUTPUT"
+          exit "$result"
+
+  publish:
+    needs:
+      - baseline
+      - generate
+      - verify-backend
+      - verify-frontend
+      - repair
+      - verify-repair-backend
+      - verify-repair-frontend
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Check out trusted publication tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Check out PR branch for the gated test-only commit
+        if: needs.baseline.result == 'success' && needs.baseline.outputs.passed == 'true' && needs.generate.result == 'success' && ((needs.verify-backend.result == 'success' && needs.verify-backend.outputs.passed == 'true' && needs.verify-frontend.result == 'success' && needs.verify-frontend.outputs.passed == 'true') || (needs.verify-repair-backend.result == 'success' && needs.verify-repair-backend.outputs.passed == 'true' && needs.verify-repair-frontend.result == 'success' && needs.verify-repair-frontend.outputs.passed == 'true'))
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Select the generated or repaired artifact
+        id: artifact
+        if: needs.generate.result == 'success'
+        run: |
+          if [ "${{ needs.verify-repair-backend.outputs.passed }}" = "true" ] && [ "${{ needs.verify-repair-frontend.outputs.passed }}" = "true" ]; then
+            echo "name=repaired-tests" >> "$GITHUB_OUTPUT"
+            echo "directory=repaired" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=generated-tests" >> "$GITHUB_OUTPUT"
+            echo "directory=generated" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download generation result
+        if: steps.artifact.outcome == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: ${{ runner.temp }}/${{ steps.artifact.outputs.directory }}
+
+      - name: Confirm PR head is unchanged
+        id: current-head
+        if: needs.baseline.result == 'success' && needs.baseline.outputs.passed == 'true' && needs.generate.result == 'success' && ((needs.verify-backend.result == 'success' && needs.verify-backend.outputs.passed == 'true' && needs.verify-frontend.result == 'success' && needs.verify-frontend.outputs.passed == 'true') || (needs.verify-repair-backend.result == 'success' && needs.verify-repair-backend.outputs.passed == 'true' && needs.verify-repair-frontend.result == 'success' && needs.verify-repair-frontend.outputs.passed == 'true'))
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const { data } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: context.issue.number
+            });
+            const unchanged = data.head.sha === context.payload.pull_request.head.sha;
+            core.setOutput('unchanged', String(unchanged));
+            if (!unchanged) core.warning('PR head changed during test generation; refusing to push the generated tests.');
+
+      - name: Finalize state and apply the verified test bundle
+        if: steps.current-head.outputs.unchanged == 'true'
+        working-directory: trusted
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BUNDLE_DIR: ${{ runner.temp }}/${{ steps.artifact.outputs.directory }}
+        run: |
+          python scripts/agent/orchestrator.py record-verification \
+            --state-file "$BUNDLE_DIR/state.json" \
+            --result passed
+          python scripts/agent/orchestrator.py apply \
+            --bundle-file "$BUNDLE_DIR/bundle.json" \
+            --repo-dir "$GITHUB_WORKSPACE/pr" \
+            --head-sha "$HEAD_SHA" \
+            --base-sha "$BASE_SHA"
+          python scripts/agent/orchestrator.py stage-bundle \
+            --bundle-file "$BUNDLE_DIR/bundle.json" \
+            --repo-dir "$GITHUB_WORKSPACE/pr" \
+            --head-sha "$HEAD_SHA"
+
+      - name: Commit verified tests to the PR branch
+        id: commit
+        if: steps.current-head.outputs.unchanged == 'true'
+        env:
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git -C "$GITHUB_WORKSPACE/pr" diff --cached --quiet; then
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            echo "No test-file changes to commit."
+            exit 0
+          fi
+          git -C "$GITHUB_WORKSPACE/pr" config user.name "github-actions[bot]"
+          git -C "$GITHUB_WORKSPACE/pr" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$GITHUB_WORKSPACE/pr" commit -m "[test-agent] Add verified PR tests"
+          git -C "$GITHUB_WORKSPACE/pr" push \
+            --force-with-lease="refs/heads/${PR_HEAD_REF}:${PR_HEAD_SHA}" \
+            origin "HEAD:refs/heads/${PR_HEAD_REF}"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish results to the PR
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          BASELINE_BACKEND: ${{ needs.baseline.outputs.backend }}
+          BASELINE_FRONTEND: ${{ needs.baseline.outputs.frontend }}
+          BASELINE_BACKEND_COVERAGE: ${{ needs.baseline.outputs.backend_coverage }}
+          BASELINE_FRONTEND_COVERAGE: ${{ needs.baseline.outputs.frontend_coverage }}
+          GENERATE_RESULT: ${{ needs.generate.result }}
+          DECISION: ${{ needs.generate.outputs.decision }}
+          PR_BACKEND: ${{ needs.verify-backend.outputs.passed }}
+          PR_FRONTEND: ${{ needs.verify-frontend.outputs.passed }}
+          PR_BACKEND_COVERAGE: ${{ needs.verify-backend.outputs.coverage }}
+          PR_FRONTEND_COVERAGE: ${{ needs.verify-frontend.outputs.coverage }}
+          REPAIR_JOB: ${{ needs.repair.result }}
+          REPAIR_BACKEND: ${{ needs.verify-repair-backend.outputs.passed }}
+          REPAIR_FRONTEND: ${{ needs.verify-repair-frontend.outputs.passed }}
+          REPAIR_BACKEND_COVERAGE: ${{ needs.verify-repair-backend.outputs.coverage }}
+          REPAIR_FRONTEND_COVERAGE: ${{ needs.verify-repair-frontend.outputs.coverage }}
+          COMMIT_RESULT: ${{ steps.commit.outcome }}
+          COMMIT_CREATED: ${{ steps.commit.outputs.created }}
+          HEAD_UNCHANGED: ${{ steps.current-head.outputs.unchanged }}
+          BUNDLE_DIR: ${{ runner.temp }}/${{ steps.artifact.outputs.directory }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- pr-test-agent-results -->';
+            const clean = (value, max = 1000) => String(value || '')
+              .replace(/@/g, '@\u200b')
+              .replace(/[<>`]/g, '')
+              .replace(/\r?\n/g, ' ')
+              .replace(/\|/g, '\\|')
+              .slice(0, max);
+            let planSummary = 'No validated agent plan is available.';
+            let targets = [];
+            let fileDecisions = [];
+            let skills = [];
+            let uncertainties = [];
+            const bundlePath = `${process.env.BUNDLE_DIR || ''}/bundle.json`;
+            if (fs.existsSync(bundlePath)) {
+              try {
+                const bundle = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));
+                planSummary = clean(bundle.plan?.summary || planSummary);
+                fileDecisions = (bundle.plan?.file_decisions || []).map(item =>
+                  `- \`${clean(item.implementation_file, 180)}\`: **${clean(item.decision, 40)}** — ${clean(item.reason, 350)}`
+                );
+                targets = (bundle.plan?.targets || []).map(target =>
+                  `- \`${clean(target.implementation_file, 180)}\` → \`${clean(target.test_file, 180)}\`: ${clean(target.reason, 350)}`
+                );
+                skills = (bundle.plan?.skills_used || []).map(skill => clean(skill, 80));
+                uncertainties = (bundle.plan?.uncertainties || []).map(item => `- ${clean(item, 350)}`);
+              } catch (error) {
+                core.warning(`Unable to read agent report artifact: ${error.message}`);
+              }
+            }
+            const finalBackendCoverage = process.env.REPAIR_BACKEND === 'true'
+              ? process.env.REPAIR_BACKEND_COVERAGE
+              : process.env.PR_BACKEND_COVERAGE;
+            const finalFrontendCoverage = process.env.REPAIR_FRONTEND === 'true'
+              ? process.env.REPAIR_FRONTEND_COVERAGE
+              : process.env.PR_FRONTEND_COVERAGE;
+            const coverageRows = [
+              ['backend', process.env.BASELINE_BACKEND_COVERAGE, finalBackendCoverage],
+              ['frontend', process.env.BASELINE_FRONTEND_COVERAGE, finalFrontendCoverage]
+            ].map(([area, base, pr]) => {
+              const baseNumber = Number(base);
+              const prNumber = Number(pr);
+              const valid = Number.isFinite(baseNumber) && Number.isFinite(prNumber);
+              const delta = valid ? prNumber - baseNumber : null;
+              const deltaText = delta === null ? 'unavailable' : `${delta > 0 ? '+' : ''}${delta.toFixed(2)} pp`;
+              return `| ${area} | ${valid ? `${baseNumber}%` : 'unavailable'} | ${valid ? `${prNumber}%` : 'unavailable'} | ${deltaText} |`;
+            });
+            const body = [
+              marker,
+              '## PR test agent results',
+              '',
+              '| Check | Result |',
+              '|---|---|',
+              `| Base backend tests | ${clean(process.env.BASELINE_BACKEND || 'not run')} |`,
+              `| Base frontend tests | ${clean(process.env.BASELINE_FRONTEND || 'not run')} |`,
+              `| Single-agent generation | ${clean(process.env.GENERATE_RESULT || 'not run')} |`,
+              `| Agent decision | ${clean(process.env.DECISION || 'not available')} |`,
+              `| PR backend tests | ${clean(process.env.PR_BACKEND || 'not run')} |`,
+              `| PR frontend tests | ${clean(process.env.PR_FRONTEND || 'not run')} |`,
+              `| Bounded repair job | ${clean(process.env.REPAIR_JOB || 'not run')} |`,
+              `| Repaired backend tests | ${clean(process.env.REPAIR_BACKEND || 'not run')} |`,
+              `| Repaired frontend tests | ${clean(process.env.REPAIR_FRONTEND || 'not run')} |`,
+              `| PR head unchanged | ${clean(process.env.HEAD_UNCHANGED || 'not checked')} |`,
+              `| Test commit | ${clean(process.env.COMMIT_RESULT || 'not attempted')}${process.env.COMMIT_CREATED === 'true' ? ' (created)' : ''} |`,
+              '',
+              '### Agent decision',
+              '',
+              planSummary,
+              ...(fileDecisions.length ? ['', '### Per-file decisions', ...fileDecisions] : []),
+              ...(targets.length ? ['', '### Test targets', ...targets] : []),
+              ...(skills.length ? ['', `**Reusable skills:** ${skills.join(', ')}`] : []),
+              ...(uncertainties.length ? ['', '### Uncertainties', ...uncertainties] : []),
+              '',
+              '### Statement-coverage delta',
+              '',
+              '| Area | Base | PR | Delta |',
+              '|---|---:|---:|---:|',
+              ...coverageRows,
+              '',
+              `[View workflow logs](${process.env.RUN_URL})`
+            ].join('\n');
+            await core.summary.addRaw(body).write();
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const previous = comments.find(comment => comment.body?.includes(marker));
+            if (previous) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: previous.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
