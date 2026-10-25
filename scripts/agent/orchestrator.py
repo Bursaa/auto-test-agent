@@ -319,18 +319,29 @@ def validate_plan(value: Any, changed_files: list[str]) -> dict[str, Any]:
 
 def extract_agent_plan(jsonl_text: str) -> dict[str, Any]:
     messages: list[str] = []
+    seen_types: dict[str, int] = {}
     for line in jsonl_text.splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict) or event.get("type") != "assistant.message":
+        if not isinstance(event, dict):
             continue
-        content = event.get("content")
-        if isinstance(content, str):
+        event_type = str(event.get("type"))[:60]
+        seen_types[event_type] = seen_types.get(event_type, 0) + 1
+        if event_type != "assistant.message":
+            continue
+        data = event.get("data")
+        content = data.get("content") if isinstance(data, dict) else None
+        if content is None:
+            content = event.get("content")
+        if isinstance(content, str) and content.strip():
             messages.append(content)
     if not messages:
-        raise OrchestrationError("Copilot output did not contain an assistant message.")
+        raise OrchestrationError(
+            "Copilot output did not contain an assistant message. "
+            f"Observed event types: {json.dumps(seen_types, sort_keys=True)[:500]}"
+        )
     response = messages[-1].strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", response, flags=re.DOTALL)
     if fenced:

@@ -206,8 +206,20 @@ def test_extract_agent_plan_reads_last_assistant_message_from_jsonl():
     assert extract_agent_plan(output)["decision"] == "skip"
 
 
+def test_extract_agent_plan_reads_content_nested_in_data_and_ignores_empty_tool_turns():
+    plan = '{"decision":"skip","summary":"s","file_decisions":[],"targets":[],"skills_used":[],"uncertainties":[]}'
+    output = "\n".join(
+        [
+            json.dumps({"type": "assistant.message", "data": {"content": plan}}),
+            json.dumps({"type": "assistant.message", "data": {"content": "", "toolRequests": []}}),
+        ]
+    )
+
+    assert extract_agent_plan(output)["decision"] == "skip"
+
+
 def test_extract_agent_plan_rejects_missing_assistant_response():
-    with pytest.raises(OrchestrationError, match="did not contain"):
+    with pytest.raises(OrchestrationError, match="did not contain.*tool.execution_start"):
         extract_agent_plan('{"type":"tool.execution_start"}')
 
 
