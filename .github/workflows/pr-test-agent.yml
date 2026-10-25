@@ -152,7 +152,8 @@ jobs:
           copilot \
             --agent=test-generation \
             --add-dir="$GITHUB_WORKSPACE/pr" \
-            --available-tools='read,search,edit' \
+            --available-tools='view,glob,grep,create,edit' \
+            --allow-tool='write' \
             --output-format=json \
             -p "$(cat "$RUNNER_TEMP/prompt.md")" \
             > "$RUNNER_TEMP/copilot-output.jsonl"
@@ -440,7 +441,8 @@ jobs:
           copilot \
             --agent=test-generation \
             --add-dir="$GITHUB_WORKSPACE/pr" \
-            --available-tools='read,search,edit' \
+            --available-tools='view,glob,grep,create,edit' \
+            --allow-tool='write' \
             --output-format=json \
             -p "$(cat "$RUNNER_TEMP/prompt.md")" \
             > "$RUNNER_TEMP/copilot-output.jsonl"
